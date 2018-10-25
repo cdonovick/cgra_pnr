@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 from placer import deepcopy
 from tqdm import tqdm
 from argparse import ArgumentParser
+from multiprocessing.pool import ThreadPool
+import multiprocessing
+from util import parallel_wrapper
 
 
 class Router:
@@ -425,6 +428,57 @@ class Router:
         for entry in entry_to_remove:
             pos_set.remove(entry)
 
+    def route_net_parallel(self, net, chan, bus, net_id, linked_nets,
+                           reg_net_order):
+        # need to fix it after IO is re-worked
+        route_length = 0
+        reg_route_path = {}
+        if net[0][0][0] == "i":
+            if chan != 0:
+                return chan, self.MAX_PATH_LENGTH, None, None, None
+        # make sure that it won't route on top of reg net
+        if net_id in linked_nets:
+            pos_set = set()
+            for reg_net_id in linked_nets[net_id]:
+                reg_net = self.netlists[reg_net_id]
+                for blk_id, port in reg_net:
+                    pos = self.placement[blk_id]
+                    self.dis_allow_chan(pos, port, bus, chan,
+                                        self.routing_resource,
+                                        pos_set)
+        else:
+            pos_set = None
+
+        path_len, final_path, routing_resource = \
+            self.route_net(bus, chan, net,
+                           self.routing_resource,
+                           pos_set=pos_set)
+        chan_resources = routing_resource
+        route_path = final_path
+        route_length += path_len
+        if route_length >= self.MAX_PATH_LENGTH:
+            return chan, route_length, None, None, None  # don't even bother
+        if net_id in linked_nets:
+            reg_route_path[net_id] = final_path
+            for reg_net_id in linked_nets[net_id]:
+                parent_net_id = reg_net_order[reg_net_id]
+                reg_path = reg_route_path[parent_net_id]
+                reg_net = self.netlists[reg_net_id]
+                # because routing resource has been updated, we don't
+                # need to keep track of old ones
+                # pos_set = set()
+                reg_length, reg_path, routing_resource = \
+                    self.route_reg_net(reg_net, bus, chan,
+                                       routing_resource,
+                                       reg_path,
+                                       pos_set)
+                route_length += reg_length
+                if route_length >= self.MAX_PATH_LENGTH:
+                    break  # just terminate without proceeding next
+                reg_route_path[reg_net_id] = reg_path
+                chan_resources = routing_resource
+        return chan, route_length, route_path, reg_route_path, chan_resources
+
     def route(self):
         print("INFO: Performing MST/A* routing")
         if self.fold_reg:
@@ -434,6 +488,10 @@ class Router:
             reg_nets = set()
             reg_net_order = {}
         net_list_ids = self.sort_netlist_id_for_io(self.netlists, reg_nets)
+
+        num_cpu = multiprocessing.cpu_count()
+        thread_pool = ThreadPool(max(self.channel_width, num_cpu))
+
         for net_id in tqdm(net_list_ids):
             if net_id in reg_nets:
                 continue
@@ -447,56 +505,19 @@ class Router:
             route_length = {}
             chan_resources = {}
             reg_route_path = {}
+            args = []
             for chan in range(self.channel_width):
-                # FIXME: force to use channel one
-                # need to fix it after IO is re-worked
-                if net[0][0][0] == "i":
-                    if chan != 0:
-                        route_length[chan] = self.MAX_PATH_LENGTH
-                        continue
-                # make sure that it won't route on top of reg net
-                if net_id in linked_nets:
-                    pos_set = set()
-                    for reg_net_id in linked_nets[net_id]:
-                        reg_net = self.netlists[reg_net_id]
-                        for blk_id, port in reg_net:
-                            pos = self.placement[blk_id]
-                            self.dis_allow_chan(pos, port, bus, chan,
-                                                self.routing_resource,
-                                                pos_set)
-                else:
-                    pos_set = None
-
-                path_len, final_path, routing_resource = \
-                    self.route_net(bus, chan, net,
-                                   self.routing_resource,
-                                   pos_set=pos_set)
-                chan_resources[chan] = routing_resource
-                route_path[chan] = final_path
-                route_length[chan] = path_len
-                if path_len >= self.MAX_PATH_LENGTH:
-                    continue    # don't even bother
-                if net_id in linked_nets:
-                    if chan not in reg_route_path:
-                        reg_route_path[chan] = {}
-                    reg_route_path[chan][net_id] = final_path
-                    for reg_net_id in linked_nets[net_id]:
-                        parent_net_id = reg_net_order[reg_net_id]
-                        reg_path = reg_route_path[chan][parent_net_id]
-                        reg_net = self.netlists[reg_net_id]
-                        # because routing resource has been updated, we don't
-                        # need to keep track of old ones
-                        # pos_set = set()
-                        reg_length, reg_path, routing_resource = \
-                            self.route_reg_net(reg_net, bus, chan,
-                                               routing_resource,
-                                               reg_path,
-                                               pos_set)
-                        route_length[chan] += reg_length
-                        if route_length[chan] >= self.MAX_PATH_LENGTH:
-                            break   # just terminate without proceeding next
-                        reg_route_path[chan][reg_net_id] = reg_path
-                        chan_resources[chan] = routing_resource
+                args.append([self.route_net_parallel,
+                             net, chan, bus, net_id, linked_nets,
+                             reg_net_order])
+            r = parallel_wrapper(args[0])
+            results = thread_pool.map(parallel_wrapper, args)
+            # gather results
+            for chan, route_len, route, reg_route, chan_res in results:
+                route_length[chan] = route_len
+                route_path[chan] = route
+                reg_route_path[chan] = reg_route
+                chan_resources[chan] = chan_res
 
             # find the minimum route path
             min_chan = 0

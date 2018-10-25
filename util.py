@@ -49,6 +49,10 @@ def reduce_cluster_graph(netlists, clusters, fixed_blocks,
     return new_netlist
 
 
+def parallel_wrapper(args, **kwarg):
+    func = args[0]
+    args = args[1:]
+    return func(*args, **kwarg)
 
 
 
