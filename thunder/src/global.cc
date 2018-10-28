@@ -1,7 +1,10 @@
 #include <string>
 #include <cmath>
 #include <limits>
+#include <iostream>
 #include "global.hh"
+
+#define DEBUG 1
 
 using std::map;
 using std::vector;
@@ -708,22 +711,15 @@ void GlobalPlacer::init_place() {
 double GlobalPlacer::compute_hpwl() const {
     double hpwl = 0;
     for (const auto &net : netlists_) {
-        double xmin = INT_MAX;
-        double xmax = 0;
-        double ymin = INT_MAX;
-        double ymax = 0;
-        for (const auto &box_index : net) {
-            auto const &box = boxes_[box_index];
-            if (box.cx > xmax)
-                xmax = box.cx;
-            if (box.cx < xmin)
-                xmin = box.cx;
-            if (box.cy > ymax)
-                ymax = box.cy;
-            if (box.cy < ymin)
-                ymin = box.cy;
-        }
-        hpwl += xmax - xmin + ymax - ymin;
+        hpwl += bbox_net(net);
+    }
+    return hpwl;
+}
+
+double GlobalPlacer::compute_hpwl(const ::set<int> &nets) const {
+    double hpwl = 0;
+    for (const auto &net_id : nets) {
+        hpwl += bbox_net(netlists_[net_id]);
     }
     return hpwl;
 }
@@ -934,6 +930,16 @@ GlobalPlacer::realize() {
 }
 
 void GlobalPlacer::move() {
+#if DEBUG
+    // testing code
+    double true_energy = init_energy();
+    double diff = true_energy - curr_energy;
+    if (diff < -std::numeric_limits<double>::epsilon() ||
+        diff > std::numeric_limits<double>::epsilon()) {
+        printf("%.10f %.10f\n", true_energy, curr_energy);
+        throw std::runtime_error("energy() calculation is incorrect");
+    }
+#endif
     auto box_index = global_rand_.uniform<uint64_t>(fixed_pos_.size(),
                                                         boxes_.size() - 1);
 
@@ -1089,19 +1095,53 @@ double GlobalPlacer::energy() {
 
     ClusterBox &box1_backup = backup_move.box1;
     ClusterBox &box2_backup = backup_move.box2;
+    ClusterBox &box1 = current_move_.box1;
+    ClusterBox &box2 = current_move_.box2;
 
+    // compute the old energy that associates with the changed boxes
+    ::set<int> nets;
+    for (const auto &id : box1.nets)
+        nets.insert(id);
+    if (box2.index >= 0) {
+        for (const auto &id : box2.nets)
+            nets.insert(id);
+    }
+
+    double old_hpwl = 0, old_overlap = 0, old_dsp = 0;
+    old_hpwl += compute_hpwl(nets);   //hpwl
+    old_overlap += compute_overlap_box(); // overlap
+    old_dsp += compute_special_dsp(box1_backup);
+    if (box2_backup.index >= 0)
+        old_dsp += compute_special_dsp(box2_backup);
+    old_hpwl += approx_intra_hpwl(box1_backup);
+    if (box2_backup.index >= 0)
+        old_hpwl += approx_intra_hpwl(box2_backup);
+    double old_energy = old_hpwl * hpwl_param_ + old_overlap * anneal_param_ +
+                        old_dsp * anneal_param_ * 2;
+
+    // the new ones
     boxes_[box1_backup.index].assign(current_move_.box1);
     if (box2_backup.index >= 0)
         boxes_[box2_backup.index].assign(current_move_.box2);
 
-    double new_energy = init_energy();
+    double new_hpwl = 0, new_overlap = 0, new_dsp = 0;
+    new_hpwl += compute_hpwl(nets);   // hpwl
+    new_overlap += compute_overlap_box();
+    new_dsp += compute_special_dsp(box1);
+    if (box2.index >= 0)
+        new_dsp += compute_special_dsp(box2);
+    new_hpwl += approx_intra_hpwl(box1);
+    if (box2.index >= 0)
+        new_hpwl += approx_intra_hpwl(box2);
+    double new_energy = new_hpwl * hpwl_param_ + new_overlap * anneal_param_ +
+                        new_dsp * anneal_param_ * 2;
 
     // revert it back
     boxes_[box1_backup.index].assign(box1_backup);
     if (box2_backup.index >= 0)
         boxes_[box2_backup.index].assign(box2_backup);
 
-    return new_energy;
+    return curr_energy + (new_energy - old_energy);
 }
 
 double GlobalPlacer::init_energy() {
@@ -1110,36 +1150,28 @@ double GlobalPlacer::init_energy() {
 
     // approximate the intra HPWL use the intra count
     for (const auto &box : boxes_) {
-        double w = (box.width + box.height) / 4.0;
-        hpwl += w * intra_count_[box.id];
+        hpwl += approx_intra_hpwl(box);
     }
 
     // compute the overlap
-    double overlap = 0;
-    for (const auto &box1 : boxes_) {
-        if (box1.fixed)
-            continue;
-        for (const auto &box2 : boxes_) {
-            if (box2.fixed || box1.index == box2.index)
-                continue;
-            auto [dx, dy] = compute_overlap({(int)box1.xmin, (int)box1.ymin},
-                                            {(int)box1.xmax, (int)box1.ymax},
-                                            {(int)box2.xmin, (int)box2.ymin},
-                                            {(int)box2.xmax, (int)box2.ymax});
-            if (dx <= 0 || dy <= 0)
-                continue;
-
-            overlap += dx * dy;
-        }
-    }
+    double overlap = compute_overlap_box();
 
     double special = 0;
     for (const auto &box : boxes_) {
-        // compute the dsps
-        auto dsp_blocks = box_dsp_blocks_[box.id];
-        auto xmin = box.xmin;
-        auto xmax = box.xmax;
-        for (const auto &iter : dsp_blocks) {
+        special = compute_special_dsp(box);
+    }
+    // the main job is to reduce overlap
+    return hpwl * hpwl_param_ + overlap * anneal_param_ +
+                  special * anneal_param_ * 2;
+}
+
+double GlobalPlacer::compute_special_dsp(const ClusterBox &box) {
+    // compute the dsp
+    auto dsp_blocks = box_dsp_blocks_[box.id];
+    auto xmin = box.xmin;
+    auto xmax = box.xmax;
+    double dsp = 0;
+    for (const auto &iter : dsp_blocks) {
             int needed = iter.second;
             const char blk_type = iter.first;
             auto columns = hidden_columns[blk_type];
@@ -1148,12 +1180,30 @@ double GlobalPlacer::init_energy() {
                     needed -= box.height;
             }
             if (needed > 0)
-                special += needed;
+                dsp += needed;
+        }
+    return dsp;
+}
+
+double GlobalPlacer::compute_overlap_box() const {
+    double overlap = 0;
+    for (const auto &box1 : boxes_) {
+        if (box1.fixed)
+            continue;
+        for (const auto &box2 : boxes_) {
+            if (box2.fixed || box1.index == box2.index)
+                continue;
+            auto [dx, dy] = ::compute_overlap({(int)box1.xmin, (int)box1.ymin},
+                                              {(int)box1.xmax, (int)box1.ymax},
+                                              {(int)box2.xmin, (int)box2.ymin},
+                                              {(int)box2.xmax, (int)box2.ymax});
+            if (dx <= 0 || dy <= 0)
+                continue;
+
+            overlap += dx * dy;
         }
     }
-    // the main job is to reduce overlap
-    return hpwl * hpwl_param_ + overlap * anneal_param_ +
-                  special * 10;
+    return overlap;
 }
 
 void GlobalPlacer::commit_changes() {

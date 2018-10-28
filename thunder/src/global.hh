@@ -67,6 +67,7 @@ private:
     void create_fixed_boxes();
     void create_boxes();
     double compute_hpwl() const;
+    double compute_hpwl(const std::set<int> &nets) const;
     void
     find_exterior_set(const std::vector<std::vector<bool>> &bboard,
                       const std::set<std::pair<int, int>> &assigned,
@@ -75,6 +76,8 @@ private:
 
     std::pair<std::vector<std::vector<int>>, std::map<std::string, uint32_t>>
     collapse_netlist(std::map<std::string, std::vector<std::string>>);
+    double compute_overlap_box() const;
+    double compute_special_dsp(const ClusterBox &box);
 
     // SA
     void bound_box(ClusterBox &box);
@@ -115,6 +118,33 @@ private:
 
     // TODO: add it abck to board info
     uint32_t clb_margin_ = 1;
+
+    // inline functions
+
+    inline double bbox_net(const std::vector<int> &net) const {
+        double xmin = INT_MAX;
+        double xmax = 0;
+        double ymin = INT_MAX;
+        double ymax = 0;
+        for (const auto &box_index : net) {
+            auto const &box = boxes_[box_index];
+            if (box.cx > xmax)
+                xmax = box.cx;
+            if (box.cx < xmin)
+                xmin = box.cx;
+            if (box.cy > ymax)
+                ymax = box.cy;
+            if (box.cy < ymin)
+                ymin = box.cy;
+        }
+        return xmax - xmin + ymax - ymin;
+    }
+
+    inline double approx_intra_hpwl(const ClusterBox &box) {
+        double w = (box.width + box.height) / 8.0;
+        return w * intra_count_[box.id];
+    }
+
 };
 
 
